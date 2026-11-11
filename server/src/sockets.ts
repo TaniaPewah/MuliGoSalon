@@ -159,8 +159,8 @@ export function registerSockets(io: IO, opts?: { reconnectGraceMs?: number }) {
 
       const existing = sessions.get(playerId);
       if (existing) {
-        // Same socket already joined this session.
-        if (existing.socketId === socket.id) return;
+        // Re-join even on the same socket so a duplicate session:join still
+        // gets session:ready (connect + join can fire twice).
         attachSocket(socket, playerId, existing);
         // Refresh display name / character from the client.
         existing.player = {

@@ -65,10 +65,27 @@ const CHARACTER_KEY = 'multigo:character';
 
 let toastId = 0;
 
+const PLAYER_ID_RE =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+/** UUID v4 that works on plain HTTP. `crypto.randomUUID()` is secure-context only. */
+function createPlayerId(): string {
+  const bytes = new Uint8Array(16);
+  if (typeof crypto !== 'undefined' && typeof crypto.getRandomValues === 'function') {
+    crypto.getRandomValues(bytes);
+  } else {
+    for (let i = 0; i < 16; i++) bytes[i] = Math.floor(Math.random() * 256);
+  }
+  bytes[6] = (bytes[6]! & 0x0f) | 0x40;
+  bytes[8] = (bytes[8]! & 0x3f) | 0x80;
+  const hex = Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
+
 function getOrCreatePlayerId(): string {
   const existing = localStorage.getItem(PLAYER_ID_KEY);
-  if (existing) return existing;
-  const id = crypto.randomUUID();
+  if (existing && PLAYER_ID_RE.test(existing)) return existing;
+  const id = createPlayerId();
   localStorage.setItem(PLAYER_ID_KEY, id);
   return id;
 }
@@ -177,9 +194,13 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     socket.on('practice:error', onPracticeError);
 
     // Auto-resume after a page reload when credentials are already stored.
+    // If the socket is already up (e.g. React Strict Mode remount), run the
+    // connect handler now so we do not miss the original `connect` event.
     const name = localStorage.getItem(NAME_KEY);
     const playerId = localStorage.getItem(PLAYER_ID_KEY);
-    if (name && playerId && !socket.connected) {
+    if (socket.connected) {
+      onConnect();
+    } else if (name && playerId) {
       socket.connect();
     }
 
