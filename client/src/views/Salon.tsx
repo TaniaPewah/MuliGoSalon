@@ -147,7 +147,15 @@ export function SalonView() {
             <span>🪴</span>
           </div>
           {salon.tables.map((t) => (
-            <Table key={t.id} table={t} salon={salon} players={salon.players} onSit={actions.sit} meId={me.id} />
+            <Table
+              key={t.id}
+              table={t}
+              salon={salon}
+              players={salon.players}
+              onSit={actions.sit}
+              onWalkTo={actions.moveTo}
+              meId={me.id}
+            />
           ))}
           {salon.players.map((p) => (
             <PlayerSprite key={p.id} player={p} isMe={p.id === me.id} room={salon} />
@@ -177,6 +185,9 @@ export function SalonView() {
               <strong>Sit</strong> at an empty chair; when a second player sits down at your table, the game begins.
             </p>
             <p>
+              <strong>Watch</strong> by walking up to a table that already has a game; you will join as a spectator.
+            </p>
+            <p>
               <strong>Find game</strong> pairs you with the next player who is also waiting.
             </p>
             {salon.queueSize > 0 && !queue.queued && (
@@ -201,6 +212,8 @@ function statusLabel(status: SalonPlayer['status']): string {
       return 'playing';
     case 'practice':
       return 'practising';
+    case 'spectating':
+      return 'watching';
   }
 }
 
@@ -213,20 +226,26 @@ function Table({
   salon,
   players,
   onSit,
+  onWalkTo,
   meId,
 }: {
   table: SalonTable;
   salon: { width: number; height: number };
   players: SalonPlayer[];
   onSit: (tableId: string, seat: 0 | 1) => void;
+  onWalkTo: (x: number, y: number) => void;
   meId: string;
 }) {
   return (
     <>
       <div
-        className="table"
+        className={['table', table.gameId ? 'table--live' : ''].join(' ')}
         style={{ left: pct(table.x, salon.width), top: pct(table.y, salon.height) }}
-        onClick={(e) => e.stopPropagation()}
+        onClick={(e) => {
+          e.stopPropagation();
+          if (table.gameId) onWalkTo(table.x, table.y);
+        }}
+        title={table.gameId ? 'Walk over to watch this game' : undefined}
         data-testid={`table-${table.id}`}
       >
         <div className="table__board">

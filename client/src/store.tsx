@@ -129,7 +129,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     };
     const onReady = ({ player, resume }: { player: PlayerInfo; resume: SessionResume }) => {
       setMe(player);
-      if (resume === 'game') {
+      if (resume === 'game' || resume === 'spectate') {
         setView('game');
       } else if (resume === 'practice') {
         socket.emit('practice:list');
@@ -257,7 +257,11 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       },
       leaveGame: () => {
         const g = lastGameRef.current;
-        if (g) socket.emit('game:leave', { gameId: g.id });
+        if (g) {
+          const playing = me && (g.players.black.id === me.id || g.players.white.id === me.id);
+          if (playing) socket.emit('game:leave', { gameId: g.id });
+          else socket.emit('game:unwatch', { gameId: g.id });
+        }
         lastGameRef.current = null;
         setGame(null);
         setView('salon');

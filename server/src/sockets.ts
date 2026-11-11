@@ -25,6 +25,8 @@ interface Session {
   /** Socket currently owning this session (null while disconnected within the grace window). */
   socketId: string | null;
   graceTimer: NodeJS.Timeout | null;
+  watchGameId: string | null;
+  watchTableId: string | null;
 }
 
 const MAX_MAIN_TIME_MS = 2 * 60 * 60 * 1000;
@@ -65,6 +67,7 @@ export function registerSockets(io: IO, opts?: { reconnectGraceMs?: number }) {
   const games = new GameManager({
     onState: (state) => io.to(roomOf(state.id)).emit('game:state', state),
     onFinish: (game, updated) => {
+      salon.unbindGame(game.id);
       for (const color of ['black', 'white'] as const) {
         const info = updated[color];
         const session = sessions.get(info.id);
@@ -97,16 +100,46 @@ export function registerSockets(io: IO, opts?: { reconnectGraceMs?: number }) {
     emitQueueStatus();
   };
 
-  const startGame = (aId: string, bId: string, settings: GameSettings) => {
+  const startGame = (aId: string, bId: string, settings: GameSettings, tableId?: string) => {
     const a = sessions.get(aId);
     const b = sessions.get(bId);
     if (!a || !b) return;
     const game: GoGame = games.create(a.player, b.player, settings);
+    if (tableId) salon.bindGame(tableId, game.id);
     for (const id of [aId, bId]) {
       salon.setStatus(id, 'playing');
       socketOf(id)?.join(roomOf(game.id));
     }
     io.to(roomOf(game.id)).emit('game:start', game.toState());
+    broadcastSalon();
+  };
+
+  const beginSpectating = (playerId: string, table: { id: string; gameId: string | null }) => {
+    if (!table.gameId) return;
+    const game = games.get(table.gameId);
+    const session = sessions.get(playerId);
+    const sock = socketOf(playerId);
+    if (!game || !session || !sock) return;
+    removeFromQueue(playerId);
+    session.watchGameId = game.id;
+    session.watchTableId = table.id;
+    salon.setStatus(playerId, 'spectating');
+    void sock.join(roomOf(game.id));
+    sock.emit('queue:status', { queued: false, waiting: queue.length });
+    sock.emit('game:start', game.toState());
+    broadcastSalon();
+  };
+
+  const stopSpectating = (playerId: string) => {
+    const session = sessions.get(playerId);
+    if (!session?.watchGameId) return;
+    const gameId = session.watchGameId;
+    const table = session.watchTableId ? salon.tables.find((t) => t.id === session.watchTableId) : undefined;
+    session.watchGameId = null;
+    session.watchTableId = null;
+    socketOf(playerId)?.leave(roomOf(gameId));
+    if (salon.get(playerId)?.status === 'spectating') salon.setStatus(playerId, 'idle');
+    if (table) salon.nudgeAway(playerId, table);
     broadcastSalon();
   };
 
@@ -134,6 +167,18 @@ export function registerSockets(io: IO, opts?: { reconnectGraceMs?: number }) {
       void socket.join(roomOf(game.id));
       socket.emit('game:state', game.toState());
       return 'game';
+    }
+
+    if (session.watchGameId) {
+      const watched = games.get(session.watchGameId);
+      if (watched) {
+        void socket.join(roomOf(watched.id));
+        socket.emit('game:state', watched.toState());
+        return 'spectate';
+      }
+      session.watchGameId = null;
+      session.watchTableId = null;
+      if (salon.get(playerId)?.status === 'spectating') salon.setStatus(playerId, 'idle');
     }
 
     if (session.practice) {
@@ -188,7 +233,14 @@ export function registerSockets(io: IO, opts?: { reconnectGraceMs?: number }) {
         rank: prior?.rank ?? ratingToRank(STARTING_RATING),
       };
       profiles.set(playerId, player);
-      const session: Session = { player, practice: null, socketId: null, graceTimer: null };
+      const session: Session = {
+        player,
+        practice: null,
+        socketId: null,
+        graceTimer: null,
+        watchGameId: null,
+        watchTableId: null,
+      };
       sessions.set(playerId, session);
       attachSocket(socket, playerId, session);
       salon.join(player);
@@ -200,10 +252,15 @@ export function registerSockets(io: IO, opts?: { reconnectGraceMs?: number }) {
       const id = requirePlayerId();
       if (!id || !requireSession()) return;
       const p = salon.get(id);
-      if (!p || p.status === 'playing') return;
+      if (!p || p.status === 'playing' || p.status === 'spectating' || p.status === 'practice') return;
       const wasSeated = !!p.tableId;
       const moved = salon.move(id, Number(x), Number(y));
       if (!moved) return;
+      const live = salon.liveTableNear(moved.x, moved.y);
+      if (live) {
+        beginSpectating(id, live);
+        return;
+      }
       if (wasSeated) broadcastSalon();
       else io.emit('salon:moved', { id, x: moved.x, y: moved.y });
     });
@@ -218,7 +275,7 @@ export function registerSockets(io: IO, opts?: { reconnectGraceMs?: number }) {
         return;
       }
       broadcastSalon();
-      if (result.opponentId) startGame(result.opponentId, id, result.table.settings);
+      if (result.opponentId) startGame(result.opponentId, id, result.table.settings, result.table.id);
     });
 
     socket.on('salon:stand', () => {
@@ -232,7 +289,7 @@ export function registerSockets(io: IO, opts?: { reconnectGraceMs?: number }) {
       const id = requirePlayerId();
       if (!id || !requireSession()) return;
       const p = salon.get(id);
-      if (!p || p.status === 'playing') return;
+      if (!p || p.status === 'playing' || p.status === 'spectating') return;
       if (queue.some((q) => q.playerId === id)) return;
       salon.stand(id);
       salon.setStatus(id, 'queued');
@@ -240,7 +297,12 @@ export function registerSockets(io: IO, opts?: { reconnectGraceMs?: number }) {
       if (queue.length >= 2) {
         const first = queue.shift()!;
         const second = queue.shift()!;
-        startGame(first.playerId, second.playerId, first.settings);
+        const table = salon.findFreeTable(first.settings);
+        if (table) {
+          salon.sit(first.playerId, table.id, 0);
+          salon.sit(second.playerId, table.id, 1);
+        }
+        startGame(first.playerId, second.playerId, first.settings, table?.id);
         io.to(first.playerId).emit('queue:status', { queued: false, waiting: queue.length });
         io.to(second.playerId).emit('queue:status', { queued: false, waiting: queue.length });
       } else {
@@ -281,10 +343,25 @@ export function registerSockets(io: IO, opts?: { reconnectGraceMs?: number }) {
     socket.on('game:leave', ({ gameId }) => {
       const id = requirePlayerId();
       if (!id) return;
+      const session = requireSession();
+      if (session?.watchGameId) {
+        stopSpectating(id);
+        return;
+      }
       games.leave(id, String(gameId));
       socket.leave(roomOf(String(gameId)));
       salon.setStatus(id, 'idle');
       broadcastSalon();
+    });
+
+    socket.on('game:unwatch', ({ gameId }) => {
+      const id = requirePlayerId();
+      const session = requireSession();
+      if (!id || !session) return;
+      if (session.watchGameId && session.watchGameId !== String(gameId) && gameId) {
+        // Still leave whatever they were watching.
+      }
+      stopSpectating(id);
     });
 
     socket.on('practice:list', () => {

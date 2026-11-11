@@ -22,11 +22,15 @@ export function GameView() {
     state.players.black.id === me.id ? 'black' : state.players.white.id === me.id ? 'white' : null;
   const perspective: Color = myColor ?? 'black';
   const opponentColor = opponentOf(perspective);
+  const isSpectator = myColor === null;
   const isMyTurn = state.phase === 'playing' && myColor === state.turn;
   const flipped = perspective === 'white';
 
   const statusText = (() => {
     if (state.phase === 'finished' && state.result) return resultText(state, me.id);
+    if (isSpectator) {
+      return `Watching · ${state.turn === 'black' ? 'Black' : 'White'} to play.`;
+    }
     if (state.lastMove === 'pass') {
       const passer = opponentOf(state.turn);
       return `${nameOf(state.players[passer], me.id)} passed. ${isMyTurn ? 'Pass again to end the game, or keep playing.' : ''}`;
@@ -56,19 +60,19 @@ export function GameView() {
           <GoBoard
             size={state.size}
             board={state.board}
-            hoverSign={isMyTurn && myColor ? colorToSign(myColor) : null}
+            hoverSign={isMyTurn && myColor && !isSpectator ? colorToSign(myColor) : null}
             flipped={flipped}
             lastMove={Array.isArray(state.lastMove) ? state.lastMove : null}
             koPoint={state.koPoint}
             territory={state.territory}
-            onPlace={actions.place}
+            onPlace={isSpectator ? undefined : actions.place}
           />
         </div>
 
         <PlayerCard game={game} color={perspective} meId={me.id} position="bottom" />
 
         <div className="game__controls">
-          {state.phase === 'playing' && myColor ? (
+          {state.phase === 'playing' && myColor && !isSpectator ? (
             <>
               <button className="btn btn--secondary" onClick={actions.pass} disabled={!isMyTurn} data-testid="pass-button">
                 Pass

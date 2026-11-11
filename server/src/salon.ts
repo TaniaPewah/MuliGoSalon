@@ -1,6 +1,7 @@
 import {
   TIME_CONTROL_PRESETS,
   type Character,
+  type GameSettings,
   type PlayerInfo,
   type PlayerStatus,
   type SalonPlayer,
@@ -17,15 +18,18 @@ export const SEAT_OFFSETS: [number, number][] = [
   [62, 0],
 ];
 
+/** Walk this close to a table with a live game to start spectating. */
+export const SPECTATE_RADIUS = 100;
+
 function makeTables(): SalonTable[] {
   const blitz = TIME_CONTROL_PRESETS[0].control;
   const normal = TIME_CONTROL_PRESETS[1].control;
   const long = TIME_CONTROL_PRESETS[2].control;
   return [
-    { id: 't1', label: '9×9 · Blitz', x: 230, y: 170, seats: [null, null], settings: { size: 9, timeControl: blitz } },
-    { id: 't2', label: '9×9 · Normal', x: 730, y: 170, seats: [null, null], settings: { size: 9, timeControl: normal } },
-    { id: 't3', label: '13×13 · Normal', x: 230, y: 400, seats: [null, null], settings: { size: 13, timeControl: normal } },
-    { id: 't4', label: '19×19 · Long', x: 730, y: 400, seats: [null, null], settings: { size: 19, timeControl: long } },
+    { id: 't1', label: '9×9 · Blitz', x: 230, y: 170, seats: [null, null], settings: { size: 9, timeControl: blitz }, gameId: null },
+    { id: 't2', label: '9×9 · Normal', x: 730, y: 170, seats: [null, null], settings: { size: 9, timeControl: normal }, gameId: null },
+    { id: 't3', label: '13×13 · Normal', x: 230, y: 400, seats: [null, null], settings: { size: 13, timeControl: normal }, gameId: null },
+    { id: 't4', label: '19×19 · Long', x: 730, y: 400, seats: [null, null], settings: { size: 19, timeControl: long }, gameId: null },
   ];
 }
 
@@ -82,6 +86,8 @@ export class Salon {
     if (!p || !table) return { error: 'Unknown table.' };
     if (seat !== 0 && seat !== 1) return { error: 'Unknown seat.' };
     if (p.status === 'playing') return { error: 'You are already in a game.' };
+    if (p.status === 'spectating') return { error: 'Leave the game you are watching first.' };
+    if (table.gameId) return { error: 'A game is already in progress at this table.' };
     if (table.seats[seat] && table.seats[seat] !== id) return { error: 'That seat is taken.' };
 
     this.stand(id);
@@ -108,6 +114,52 @@ export class Salon {
   leave(id: string) {
     this.stand(id);
     this.players.delete(id);
+  }
+
+  bindGame(tableId: string, gameId: string) {
+    const table = this.tables.find((t) => t.id === tableId);
+    if (table) table.gameId = gameId;
+  }
+
+  unbindGame(gameId: string) {
+    for (const t of this.tables) if (t.gameId === gameId) t.gameId = null;
+  }
+
+  tableByGame(gameId: string): SalonTable | undefined {
+    return this.tables.find((t) => t.gameId === gameId);
+  }
+
+  /** Closest table with a live game within SPECTATE_RADIUS, if any. */
+  liveTableNear(x: number, y: number): SalonTable | null {
+    let best: SalonTable | null = null;
+    let bestDist = SPECTATE_RADIUS;
+    for (const t of this.tables) {
+      if (!t.gameId) continue;
+      const dist = Math.hypot(t.x - x, t.y - y);
+      if (dist <= bestDist) {
+        best = t;
+        bestDist = dist;
+      }
+    }
+    return best;
+  }
+
+  findFreeTable(settings: GameSettings): SalonTable | undefined {
+    const empty = (t: SalonTable) => !t.gameId && !t.seats[0] && !t.seats[1];
+    const sameSettings = (t: SalonTable) =>
+      t.settings.size === settings.size &&
+      t.settings.timeControl.mainTimeMs === settings.timeControl.mainTimeMs &&
+      t.settings.timeControl.incrementMs === settings.timeControl.incrementMs;
+    return this.tables.find((t) => empty(t) && sameSettings(t)) ?? this.tables.find(empty);
+  }
+
+  /** Place the player just south of the table, outside the spectate radius. */
+  nudgeAway(id: string, table: SalonTable): SalonPlayer | null {
+    const p = this.players.get(id);
+    if (!p) return null;
+    p.x = Math.round(Math.min(SALON_WIDTH - 24, Math.max(24, table.x)));
+    p.y = Math.round(Math.min(SALON_HEIGHT - 24, Math.max(24, table.y + SPECTATE_RADIUS + 28)));
+    return p;
   }
 
   toState(queueSize: number): SalonState {

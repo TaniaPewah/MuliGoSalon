@@ -75,11 +75,11 @@ What happens when a player clicks on the board:
 
 1. **Client emits an intent.** The React client never changes the board itself. It sends `game:place { gameId, x, y }` (or `game:pass` / `game:resign`) over Socket.io. The only "optimistic" thing it draws is the translucent hover stone, which is purely cosmetic.
 2. **Server validates against the authoritative state.** The `GoGame` instance for that game checks: is the game still running, is it this player's colour, is this player's turn, has their clock already expired, is the point on the board and empty, is it the ko point, would the move be suicide. Board mechanics (captures, liberties) come from `@sabaki/go-board`; ko, repetition, passes, scoring and the clock are implemented in `server/src/game/GoGame.ts`.
-3. **On success** the move is applied: captures are removed, the ko point is recomputed, the mover's clock is charged for the elapsed time and credited the Fischer increment, the turn flips, the position hash is recorded (triple repetition ⇒ draw) and the authoritative timeout timer is re-armed for the new player to move. The server then broadcasts the **full `GameState`** (board, turn, captures, clocks sampled at server time, result, …) to the game room, i.e. both players. A full snapshot is small for Go and makes the client trivially stateless; deltas were not needed for v1.
+3. **On success** the move is applied: captures are removed, the ko point is recomputed, the mover's clock is charged for the elapsed time and credited the Fischer increment, the turn flips, the position hash is recorded (triple repetition ⇒ draw) and the authoritative timeout timer is re-armed for the new player to move. The server then broadcasts the **full `GameState`** (board, turn, captures, clocks sampled at server time, result, …) to the game room (both players and any spectators). A full snapshot is small for Go and makes the client trivially stateless; deltas were not needed for v1.
 4. **On failure** the server emits `game:error { code, message }` **only to the sender**, nothing is broadcast and nothing changes. The client shows the message as a toast.
 5. **Clocks** are never trusted from the client. Each snapshot carries the remaining time of both players at server time; the client counts down locally from the moment it received the snapshot and resynchronises on every new snapshot. When the server's timer fires it re-checks the clock and, if the flag fell, finishes the game and broadcasts the result – even if the player is idle.
 
-The same pattern is used for the salon (`salon:move`, `salon:sit` → server clamps/validates → `salon:state` / `salon:moved` broadcast) and for practice (`practice:move` → server validates legality and matches the solution tree → `practice:state` back to that player).
+The same pattern is used for the salon (`salon:move`, `salon:sit` → server clamps/validates → `salon:state` / `salon:moved` broadcast) and for practice (`practice:move` → server validates legality and matches the solution tree → `practice:state` back to that player). Walking within 100px of a table that has a live game joins the walker to that game room as a read-only spectator; they receive the same `game:state` snapshots and cannot place stones.
 
 ## Tests
 
@@ -107,4 +107,4 @@ client/src/views/          Login, Salon, Game, Practice
 
 ## Not in v1
 
-Spectating, chat, dead-stone marking before scoring, handicap games, persistence of ratings and game records across server restarts, and a smarter rating system. Page reload reconnects within a 30s grace window via a stable player id in localStorage.
+Chat, dead-stone marking before scoring, handicap games, persistence of ratings and game records across server restarts, and a smarter rating system.

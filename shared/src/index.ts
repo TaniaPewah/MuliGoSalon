@@ -93,7 +93,7 @@ export interface GameState {
   koPoint: Vertex | null;
 }
 
-export type PlayerStatus = 'idle' | 'queued' | 'playing' | 'practice';
+export type PlayerStatus = 'idle' | 'queued' | 'playing' | 'practice' | 'spectating';
 
 export interface SalonPlayer extends PlayerInfo {
   x: number;
@@ -110,6 +110,8 @@ export interface SalonTable {
   y: number;
   seats: [string | null, string | null];
   settings: GameSettings;
+  /** Live game bound to this table, if any. Spectators walk up to this. */
+  gameId: string | null;
 }
 
 export interface SalonState {
@@ -157,7 +159,7 @@ export interface GameError {
   message: string;
 }
 
-export type SessionResume = 'salon' | 'game' | 'practice';
+export type SessionResume = 'salon' | 'game' | 'practice' | 'spectate';
 
 export interface ServerToClientEvents {
   'session:ready': (payload: { player: PlayerInfo; resume: SessionResume }) => void;
@@ -184,6 +186,7 @@ export interface ClientToServerEvents {
   'game:pass': (payload: { gameId: string }) => void;
   'game:resign': (payload: { gameId: string }) => void;
   'game:leave': (payload: { gameId: string }) => void;
+  'game:unwatch': (payload: { gameId: string }) => void;
   'practice:list': () => void;
   'practice:start': (payload: { problemId: string }) => void;
   'practice:move': (payload: { x: number; y: number }) => void;
