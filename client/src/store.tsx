@@ -7,6 +7,7 @@ import type {
   PlayerInfo,
   PracticeState,
   SalonState,
+  SessionResume,
   TsumegoSummary,
 } from '@multigo/shared';
 import { socket } from './socket';
@@ -58,7 +59,23 @@ interface Store {
 
 const StoreContext = createContext<Store | null>(null);
 
+const PLAYER_ID_KEY = 'multigo:playerId';
+const NAME_KEY = 'multigo:name';
+const CHARACTER_KEY = 'multigo:character';
+
 let toastId = 0;
+
+function getOrCreatePlayerId(): string {
+  const existing = localStorage.getItem(PLAYER_ID_KEY);
+  if (existing) return existing;
+  const id = crypto.randomUUID();
+  localStorage.setItem(PLAYER_ID_KEY, id);
+  return id;
+}
+
+function emitJoin(name: string, character: Character) {
+  socket.emit('session:join', { name, character, playerId: getOrCreatePlayerId() });
+}
 
 export function StoreProvider({ children }: { children: ReactNode }) {
   const [view, setView] = useState<View>('login');
@@ -80,18 +97,31 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   }, []);
 
   useEffect(() => {
-    const onConnect = () => setConnected(true);
+    const onConnect = () => {
+      setConnected(true);
+      const name = localStorage.getItem(NAME_KEY);
+      const character = (localStorage.getItem(CHARACTER_KEY) as Character | null) ?? 'sloth';
+      const playerId = localStorage.getItem(PLAYER_ID_KEY);
+      if (name && playerId) {
+        emitJoin(name, character);
+      }
+    };
     const onDisconnect = () => {
       setConnected(false);
-      setMe(null);
-      setGame(null);
-      setSalon(null);
-      setView('login');
-      pushToast('Disconnected from the salon. Please join again.', 'info');
+      pushToast('Connection lost. Reconnecting…', 'info');
     };
-    const onReady = ({ player }: { player: PlayerInfo }) => {
+    const onReady = ({ player, resume }: { player: PlayerInfo; resume: SessionResume }) => {
       setMe(player);
-      setView('salon');
+      if (resume === 'game') {
+        setView('game');
+      } else if (resume === 'practice') {
+        socket.emit('practice:list');
+        setView('practice');
+      } else {
+        lastGameRef.current = null;
+        setGame(null);
+        setView('salon');
+      }
     };
     const onPlayer = (player: PlayerInfo) => setMe(player);
     const onSalon = (state: SalonState) => setSalon(state);
@@ -145,6 +175,14 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     socket.on('practice:list', onPracticeList);
     socket.on('practice:state', onPracticeState);
     socket.on('practice:error', onPracticeError);
+
+    // Auto-resume after a page reload when credentials are already stored.
+    const name = localStorage.getItem(NAME_KEY);
+    const playerId = localStorage.getItem(PLAYER_ID_KEY);
+    if (name && playerId && !socket.connected) {
+      socket.connect();
+    }
+
     return () => {
       socket.off('connect', onConnect);
       socket.off('disconnect', onDisconnect);
@@ -166,8 +204,11 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     () => ({
       join: (name, character) => {
         unlockAudio();
+        localStorage.setItem(NAME_KEY, name);
+        localStorage.setItem(CHARACTER_KEY, character);
+        getOrCreatePlayerId();
         if (!socket.connected) socket.connect();
-        const send = () => socket.emit('session:join', { name, character });
+        const send = () => emitJoin(name, character);
         if (socket.connected) send();
         else socket.once('connect', send);
       },

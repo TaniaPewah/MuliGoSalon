@@ -107,4 +107,4 @@ client/src/views/          Login, Salon, Game, Practice
 
 ## Not in v1
 
-Spectating, chat, reconnection after a page reload, dead-stone marking before scoring, handicap games, persistence of ratings and game records, and a smarter rating system.
+Spectating, chat, dead-stone marking before scoring, handicap games, persistence of ratings and game records across server restarts, and a smarter rating system. Page reload reconnects within a 30s grace window via a stable player id in localStorage.

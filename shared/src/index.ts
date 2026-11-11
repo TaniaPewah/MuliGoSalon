@@ -157,8 +157,10 @@ export interface GameError {
   message: string;
 }
 
+export type SessionResume = 'salon' | 'game' | 'practice';
+
 export interface ServerToClientEvents {
-  'session:ready': (payload: { player: PlayerInfo }) => void;
+  'session:ready': (payload: { player: PlayerInfo; resume: SessionResume }) => void;
   'session:player': (player: PlayerInfo) => void;
   'salon:state': (state: SalonState) => void;
   'salon:moved': (payload: { id: string; x: number; y: number }) => void;
@@ -172,7 +174,7 @@ export interface ServerToClientEvents {
 }
 
 export interface ClientToServerEvents {
-  'session:join': (payload: { name: string; character: Character }) => void;
+  'session:join': (payload: { name: string; character: Character; playerId: string }) => void;
   'salon:move': (payload: { x: number; y: number }) => void;
   'salon:sit': (payload: { tableId: string; seat: 0 | 1 }) => void;
   'salon:stand': () => void;

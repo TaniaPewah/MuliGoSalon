@@ -8,6 +8,7 @@ import {
   type GameSettings,
   type PlayerInfo,
   type ServerToClientEvents,
+  type SessionResume,
 } from '@multigo/shared';
 import { GameManager } from './GameManager.js';
 import { Salon, sanitizeCharacter, sanitizeName } from './salon.js';
@@ -21,19 +22,33 @@ type Sock = Socket<ClientToServerEvents, ServerToClientEvents>;
 interface Session {
   player: PlayerInfo;
   practice: PracticeSession | null;
+  /** Socket currently owning this session (null while disconnected within the grace window). */
+  socketId: string | null;
+  graceTimer: NodeJS.Timeout | null;
 }
 
 const MAX_MAIN_TIME_MS = 2 * 60 * 60 * 1000;
 const MAX_INCREMENT_MS = 60 * 1000;
+export const RECONNECT_GRACE_MS = 30_000;
 
-export function registerSockets(io: IO) {
+export function registerSockets(io: IO, opts?: { reconnectGraceMs?: number }) {
+  const reconnectGraceMs = opts?.reconnectGraceMs ?? RECONNECT_GRACE_MS;
   const sessions = new Map<string, Session>();
+  const socketToPlayer = new Map<string, string>();
+  /** Survives grace-window cleanup so a later rejoin keeps the last rating. */
+  const profiles = new Map<string, PlayerInfo>();
   const salon = new Salon();
   const queue: { playerId: string; settings: GameSettings }[] = [];
 
   const roomOf = (gameId: string) => `game:${gameId}`;
 
   const broadcastSalon = () => io.emit('salon:state', salon.toState(queue.length));
+
+  const socketOf = (playerId: string): Sock | undefined => {
+    const session = sessions.get(playerId);
+    if (!session?.socketId) return undefined;
+    return io.sockets.sockets.get(session.socketId) as Sock | undefined;
+  };
 
   const emitQueueStatus = () => {
     for (const entry of queue) {
@@ -55,6 +70,7 @@ export function registerSockets(io: IO) {
         const session = sessions.get(info.id);
         if (session) {
           session.player = info;
+          profiles.set(info.id, info);
           salon.updateInfo(info);
           salon.setStatus(info.id, 'idle');
           salon.stand(info.id);
@@ -65,6 +81,22 @@ export function registerSockets(io: IO) {
     },
   });
 
+  const finalizeDisconnect = (playerId: string) => {
+    const session = sessions.get(playerId);
+    if (!session) return;
+    if (session.graceTimer) {
+      clearTimeout(session.graceTimer);
+      session.graceTimer = null;
+    }
+    removeFromQueue(playerId);
+    games.abandon(playerId);
+    salon.leave(playerId);
+    if (session.socketId) socketToPlayer.delete(session.socketId);
+    sessions.delete(playerId);
+    broadcastSalon();
+    emitQueueStatus();
+  };
+
   const startGame = (aId: string, bId: string, settings: GameSettings) => {
     const a = sessions.get(aId);
     const b = sessions.get(bId);
@@ -72,34 +104,101 @@ export function registerSockets(io: IO) {
     const game: GoGame = games.create(a.player, b.player, settings);
     for (const id of [aId, bId]) {
       salon.setStatus(id, 'playing');
-      io.sockets.sockets.get(id)?.join(roomOf(game.id));
+      socketOf(id)?.join(roomOf(game.id));
     }
     io.to(roomOf(game.id)).emit('game:start', game.toState());
     broadcastSalon();
   };
 
-  io.on('connection', (socket: Sock) => {
-    const id = socket.id;
+  const attachSocket = (socket: Sock, playerId: string, session: Session) => {
+    if (session.graceTimer) {
+      clearTimeout(session.graceTimer);
+      session.graceTimer = null;
+    }
+    if (session.socketId && session.socketId !== socket.id) {
+      socketToPlayer.delete(session.socketId);
+    }
+    session.socketId = socket.id;
+    socketToPlayer.set(socket.id, playerId);
+    void socket.join(playerId);
+  };
 
-    const requireSession = (): Session | null => sessions.get(id) ?? null;
+  const resumeFor = (socket: Sock, playerId: string, session: Session): SessionResume => {
+    socket.emit('salon:state', salon.toState(queue.length));
+    if (queue.some((q) => q.playerId === playerId)) {
+      socket.emit('queue:status', { queued: true, waiting: queue.length });
+    }
+
+    const game = games.gameOf(playerId);
+    if (game) {
+      void socket.join(roomOf(game.id));
+      socket.emit('game:state', game.toState());
+      return 'game';
+    }
+
+    if (session.practice) {
+      socket.emit('practice:state', session.practice.toState());
+      return 'practice';
+    }
+
+    return 'salon';
+  };
+
+  io.on('connection', (socket: Sock) => {
+    const requireSession = (): Session | null => {
+      const playerId = socketToPlayer.get(socket.id);
+      if (!playerId) return null;
+      return sessions.get(playerId) ?? null;
+    };
+
+    const requirePlayerId = (): string | null => socketToPlayer.get(socket.id) ?? null;
 
     socket.on('session:join', (payload) => {
-      if (sessions.has(id)) return;
+      const playerId = sanitizePlayerId(payload?.playerId);
+      if (!playerId) return;
+
+      const existing = sessions.get(playerId);
+      if (existing) {
+        // Same socket already joined this session.
+        if (existing.socketId === socket.id) return;
+        attachSocket(socket, playerId, existing);
+        // Refresh display name / character from the client.
+        existing.player = {
+          ...existing.player,
+          name: sanitizeName(payload?.name),
+          character: sanitizeCharacter(payload?.character),
+        };
+        profiles.set(playerId, existing.player);
+        salon.updateInfo(existing.player);
+        const resume = resumeFor(socket, playerId, existing);
+        socket.emit('session:ready', { player: existing.player, resume });
+        broadcastSalon();
+        return;
+      }
+
+      // Reject if this socket already owns a different session.
+      if (socketToPlayer.has(socket.id)) return;
+
+      const prior = profiles.get(playerId);
       const player: PlayerInfo = {
-        id,
+        id: playerId,
         name: sanitizeName(payload?.name),
         character: sanitizeCharacter(payload?.character),
-        rating: STARTING_RATING,
-        rank: ratingToRank(STARTING_RATING),
+        rating: prior?.rating ?? STARTING_RATING,
+        rank: prior?.rank ?? ratingToRank(STARTING_RATING),
       };
-      sessions.set(id, { player, practice: null });
+      profiles.set(playerId, player);
+      const session: Session = { player, practice: null, socketId: null, graceTimer: null };
+      sessions.set(playerId, session);
+      attachSocket(socket, playerId, session);
       salon.join(player);
-      socket.emit('session:ready', { player });
+      socket.emit('session:ready', { player, resume: 'salon' });
       broadcastSalon();
     });
 
     socket.on('salon:move', ({ x, y }) => {
-      if (!requireSession()) return;
+      const id = requirePlayerId();
+      if (!id || !requireSession()) return;
       const p = salon.get(id);
       if (!p || p.status === 'playing') return;
       const wasSeated = !!p.tableId;
@@ -110,7 +209,8 @@ export function registerSockets(io: IO) {
     });
 
     socket.on('salon:sit', ({ tableId, seat }) => {
-      if (!requireSession()) return;
+      const id = requirePlayerId();
+      if (!id || !requireSession()) return;
       removeFromQueue(id);
       const result = salon.sit(id, String(tableId), seat);
       if ('error' in result) {
@@ -122,13 +222,15 @@ export function registerSockets(io: IO) {
     });
 
     socket.on('salon:stand', () => {
-      if (!requireSession()) return;
+      const id = requirePlayerId();
+      if (!id || !requireSession()) return;
       salon.stand(id);
       broadcastSalon();
     });
 
     socket.on('queue:join', (settings) => {
-      if (!requireSession()) return;
+      const id = requirePlayerId();
+      if (!id || !requireSession()) return;
       const p = salon.get(id);
       if (!p || p.status === 'playing') return;
       if (queue.some((q) => q.playerId === id)) return;
@@ -148,27 +250,37 @@ export function registerSockets(io: IO) {
     });
 
     socket.on('queue:leave', () => {
+      const id = requirePlayerId();
+      if (!id) return;
       removeFromQueue(id);
       socket.emit('queue:status', { queued: false, waiting: queue.length });
       broadcastSalon();
     });
 
     socket.on('game:place', ({ gameId, x, y }) => {
+      const id = requirePlayerId();
+      if (!id) return;
       const res = games.place(id, String(gameId), Number(x), Number(y));
       if (!res.ok) socket.emit('game:error', res.error);
     });
 
     socket.on('game:pass', ({ gameId }) => {
+      const id = requirePlayerId();
+      if (!id) return;
       const res = games.pass(id, String(gameId));
       if (!res.ok) socket.emit('game:error', res.error);
     });
 
     socket.on('game:resign', ({ gameId }) => {
+      const id = requirePlayerId();
+      if (!id) return;
       const res = games.resign(id, String(gameId));
       if (!res.ok) socket.emit('game:error', res.error);
     });
 
     socket.on('game:leave', ({ gameId }) => {
+      const id = requirePlayerId();
+      if (!id) return;
       games.leave(id, String(gameId));
       socket.leave(roomOf(String(gameId)));
       salon.setStatus(id, 'idle');
@@ -180,8 +292,9 @@ export function registerSockets(io: IO) {
     });
 
     socket.on('practice:start', ({ problemId }) => {
+      const id = requirePlayerId();
       const session = requireSession();
-      if (!session) return;
+      if (!id || !session) return;
       const problem = findProblem(String(problemId));
       if (!problem) {
         socket.emit('practice:error', { code: 'not-found', message: 'Unknown problem.' });
@@ -209,22 +322,42 @@ export function registerSockets(io: IO) {
     });
 
     socket.on('practice:stop', () => {
+      const id = requirePlayerId();
       const session = requireSession();
-      if (!session) return;
+      if (!id || !session) return;
       session.practice = null;
       if (salon.get(id)?.status === 'practice') salon.setStatus(id, 'idle');
       broadcastSalon();
     });
 
     socket.on('disconnect', () => {
-      removeFromQueue(id);
-      games.abandon(id);
-      salon.leave(id);
-      sessions.delete(id);
-      broadcastSalon();
-      emitQueueStatus();
+      const playerId = socketToPlayer.get(socket.id);
+      if (!playerId) return;
+      const session = sessions.get(playerId);
+      if (!session) {
+        socketToPlayer.delete(socket.id);
+        return;
+      }
+      // A newer socket already owns this session (e.g. second tab / faster reconnect).
+      if (session.socketId !== socket.id) {
+        socketToPlayer.delete(socket.id);
+        return;
+      }
+      session.socketId = null;
+      socketToPlayer.delete(socket.id);
+      if (session.graceTimer) clearTimeout(session.graceTimer);
+      session.graceTimer = setTimeout(() => finalizeDisconnect(playerId), reconnectGraceMs);
     });
   });
+}
+
+/** Accept UUID-shaped ids from the client; reject empty / oversized junk. */
+function sanitizePlayerId(raw: unknown): string | null {
+  const id = String(raw ?? '').trim();
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(id)) {
+    return null;
+  }
+  return id.toLowerCase();
 }
 
 function sanitizeSettings(raw: unknown): GameSettings {
